@@ -1827,17 +1827,16 @@ async function resolveTabId(tabId: number | undefined, leaseKey: string, initial
 async function listAutomationTabs(leaseKey: string): Promise<chrome.tabs.Tab[]> {
   const session = automationSessions.get(leaseKey);
   if (!session) return [];
-  if (session.ownWindow) {
-    try {
-      return await chrome.tabs.query({ windowId: session.windowId });
-    } catch { return []; }
-  }
   if (session.preferredTabId !== null) {
     try {
       const own = [await chrome.tabs.get(session.preferredTabId)];
       for (const id of adoptedOf(leaseKey)) { try { own.push(await chrome.tabs.get(id)); } catch { adoptedOf(leaseKey).delete(id); } }
       return own;
     } catch {
+      // An own-window session keeps its lease while its window lives: list the window instead.
+      if (session.ownWindow) {
+        try { return await chrome.tabs.query({ windowId: session.windowId }); } catch { return []; }
+      }
       automationSessions.delete(leaseKey);
       return [];
     }

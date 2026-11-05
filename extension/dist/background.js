@@ -1085,9 +1085,20 @@ async function connectAttempt() {
 function sessionsOwningTab(tabId) {
   const names = [];
   for (const [leaseKey, session] of automationSessions.entries()) {
-    if (session.preferredTabId === tabId || adoptedTabs.get(leaseKey)?.has(tabId)) names.push(session.session);
+    if (session.preferredTabId === tabId || adoptedTabs.get(leaseKey)?.has(tabId)) {
+      names.push(session.session);
+      touchWatchedLease(leaseKey);
+    }
   }
   return names;
+}
+const WATCH_TOUCH_MS = 3e4;
+const lastWatchTouch = /* @__PURE__ */ new Map();
+function touchWatchedLease(leaseKey) {
+  const now = Date.now();
+  if (now - (lastWatchTouch.get(leaseKey) ?? 0) < WATCH_TOUCH_MS) return;
+  lastWatchTouch.set(leaseKey, now);
+  resetWindowIdleTimer(leaseKey);
 }
 async function relayEvent(tabId, method, params, receivedAt, pageOverride) {
   const names = sessionsOwningTab(tabId);
@@ -1739,6 +1750,7 @@ async function createOwnedTabLeaseUnlocked(leaseKey, initialUrl) {
       await new Promise((resolve) => setTimeout(resolve, 300));
       ownTab = await chrome.tabs.get(ownTabId);
     }
+    ownedWindowLedger.set(ownWindowId, leaseKey);
     setLeaseSession(leaseKey, {
       session: getSessionFromKey(leaseKey),
       surface: getSurfaceFromKey(leaseKey),
@@ -1813,6 +1825,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
       container.groupId = null;
     }
   }
+  ownedWindowLedger.delete(windowId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.windowId === windowId) {
       console.log(`[opencli] ${session.surface} container closed (session=${session.session})`);
@@ -1825,6 +1838,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   await persistRuntimeState();
 });
 const adoptedTabs = /* @__PURE__ */ new Map();
+const ownedWindowLedger = /* @__PURE__ */ new Map();
 function adoptedOf(leaseKey) {
   let set = adoptedTabs.get(leaseKey);
   if (!set) {
@@ -1862,6 +1876,16 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
         session.preferredTabId = next;
         console.log(`[opencli] Session ${session.session} promoted tab ${next} (tab ${tabId} closed)`);
         continue;
+      }
+      if (session.ownWindow) {
+        const rest = await chrome.tabs.query({ windowId: session.windowId }).catch(() => []);
+        const other = rest.find((t) => t.id !== void 0 && t.id !== tabId && isDebuggableUrl(t.url));
+        if (other?.id !== void 0) {
+          session.preferredTabId = other.id;
+          for (const t of rest) if (t.id !== void 0 && t.id !== tabId && t.id !== other.id) adoptedOf(leaseKey).add(t.id);
+          console.log(`[opencli] Session ${session.session} promoted window tab ${other.id} (tab ${tabId} closed)`);
+          continue;
+        }
       }
       if (session.idleTimer) clearTimeout(session.idleTimer);
       automationSessions.delete(leaseKey);
@@ -2105,6 +2129,27 @@ async function resolveCommandTabId(cmd) {
   if (cmd.page) return resolveTabId$1(cmd.page);
   return void 0;
 }
+async function adoptOrphanTab(leaseKey, tab) {
+  const tabId = tab.id;
+  const existing = automationSessions.get(leaseKey);
+  if (existing) {
+    if (existing.preferredTabId !== tabId) adoptedOf(leaseKey).add(tabId);
+    return;
+  }
+  setLeaseSession(leaseKey, {
+    session: getSessionFromKey(leaseKey),
+    surface: getSurfaceFromKey(leaseKey),
+    kind: "owned",
+    windowId: tab.windowId,
+    owned: true,
+    preferredTabId: tabId,
+    ownWindow: true
+  });
+  const others = await chrome.tabs.query({ windowId: tab.windowId }).catch(() => []);
+  for (const t of others) if (t.id !== void 0 && t.id !== tabId) adoptedOf(leaseKey).add(t.id);
+  resetWindowIdleTimer(leaseKey);
+  console.log(`[opencli] ${(/* @__PURE__ */ new Date()).toISOString()} Session ${getSessionFromKey(leaseKey)} re-adopted tab ${tabId} in window ${tab.windowId}`);
+}
 async function resolveTab(tabId, leaseKey, initialUrl) {
   const existingSession = automationSessions.get(leaseKey);
   if (tabId !== void 0) {
@@ -2113,6 +2158,13 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
       const session = existingSession;
       const matchesSession = session ? session.preferredTabId !== null ? session.preferredTabId === tabId || adoptedOf(leaseKey).has(tabId) : tab.windowId === session.windowId : false;
       if (isDebuggableUrl(tab.url) && matchesSession) return { tabId, tab };
+      if (isDebuggableUrl(tab.url) && tab.windowId !== void 0) {
+        const inOwnWindow = session ? session.ownWindow === true && session.windowId === tab.windowId : ownedWindowLedger.get(tab.windowId) === leaseKey;
+        if (inOwnWindow) {
+          await adoptOrphanTab(leaseKey, tab);
+          return { tabId, tab };
+        }
+      }
       if (session && !session.owned) {
         throw new CommandFailure(
           matchesSession ? "bound_tab_not_debuggable" : "bound_tab_mismatch",
@@ -2222,6 +2274,13 @@ async function listAutomationTabs(leaseKey) {
       }
       return own;
     } catch {
+      if (session.ownWindow) {
+        try {
+          return await chrome.tabs.query({ windowId: session.windowId });
+        } catch {
+          return [];
+        }
+      }
       automationSessions.delete(leaseKey);
       return [];
     }
@@ -2266,7 +2325,6 @@ async function handleExec(cmd, leaseKey) {
   if (!cmd.code) return { id: cmd.id, ok: false, error: "Missing code" };
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
-  await activateIfHidden(tabId, leaseKey);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
     if (cmd.frameIndex != null) {
@@ -2310,6 +2368,10 @@ async function closeSessionTab(leaseKey, tabId) {
   await safeDetach(tabId);
   await chrome.tabs.remove(tabId);
 }
+const ACTIVATING_CDP = /* @__PURE__ */ new Set(["Page.captureScreenshot", "Page.startScreencast"]);
+function cdpNeedsVisibleTab(method) {
+  return method.startsWith("Input.") || ACTIVATING_CDP.has(method);
+}
 async function activateIfHidden(tabId, leaseKey) {
   if (!automationSessions.get(leaseKey)?.ownWindow) return;
   try {
@@ -2342,7 +2404,6 @@ async function handleNavigate(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const resolved = await resolveTab(cmdTabId, leaseKey);
   const tabId = resolved.tabId;
-  await activateIfHidden(tabId, leaseKey);
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
@@ -2574,6 +2635,7 @@ async function handleCookies(cmd) {
 async function handleScreenshot(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
+  await activateIfHidden(tabId, leaseKey);
   try {
     const data = await screenshot(tabId, {
       format: cmd.format,
@@ -2634,7 +2696,7 @@ async function handleCdp(cmd, leaseKey) {
   }
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
-  await activateIfHidden(tabId, leaseKey);
+  if (cdpNeedsVisibleTab(cmd.cdpMethod)) await activateIfHidden(tabId, leaseKey);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
     await ensureAttached(tabId, aggressive);
@@ -2722,6 +2784,7 @@ async function handleInsertText(cmd, leaseKey) {
   }
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
+  await activateIfHidden(tabId, leaseKey);
   try {
     await insertText(tabId, cmd.text);
     return pageScopedResult(cmd.id, tabId, { inserted: true });
@@ -2775,6 +2838,7 @@ async function releaseLease(leaseKey, reason = "released") {
         evictTab(id);
       }
       adoptedTabs.delete(leaseKey);
+      ownedWindowLedger.delete(session.windowId);
       await chrome.windows.remove(session.windowId).catch(() => {
       });
       console.log(`[opencli] Released session window ${session.windowId} (session=${session.session}, ${reason})`);
@@ -2853,6 +2917,11 @@ async function reconcileTargetLeaseRegistry() {
         idleTimer: null,
         idleDeadlineAt: stored.idleDeadlineAt
       });
+      if (session.ownWindow) {
+        ownedWindowLedger.set(tab.windowId, leaseKey);
+        const winTabs = await chrome.tabs.query({ windowId: tab.windowId }).catch(() => []);
+        for (const t of winTabs) if (t.id !== void 0 && t.id !== tabId) adoptedOf(leaseKey).add(t.id);
+      }
       if (session.owned && !session.ownWindow) {
         const role = getOwnedWindowRole(leaseKey);
         if (ownedContainers[role].windowId === null) ownedContainers[role].windowId = tab.windowId;
