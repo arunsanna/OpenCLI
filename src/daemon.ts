@@ -363,29 +363,20 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     return;
   }
 
-  // Spike 017 routes
+  // Live view event routes
   if (req.method === 'GET' && pathname === '/events/stats') {
     const ms = Number(new URL(url, `http://localhost:${PORT}`).searchParams.get('window') ?? 5000);
-    jsonResponse(res, 200, spikeStats(ms));
-    return;
-  }
-  if (req.method === 'GET' && pathname === '/events/frame') {
-    if (!spikeLastFrame) { jsonResponse(res, 404, { ok: false, error: 'no frame yet' }); return; }
-    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'X-Frame-At': String(spikeLastFrame.at), 'X-Frame-Tab': String(spikeLastFrame.tabId) });
-    res.end(spikeLastFrame.jpeg);
-    return;
-  }
-  if (req.method === 'POST' && pathname === '/events/reset') {
-    spikeEvents.length = 0; spikeTotal = 0; spikeLastFrame = null;
-    jsonResponse(res, 200, { ok: true });
+    jsonResponse(res, 200, eventStats(ms));
     return;
   }
   if (req.method === 'GET' && pathname === '/events/stream') {
+    const session = new URL(url, `http://localhost:${PORT}`).searchParams.get('session')?.trim() || null;
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-    res.write(': spike 017 event stream\n\n');
-    spikeSubscribers.add(res);
+    res.write(': live view event stream\n\n');
+    const sub = { res, session };
+    eventSubscribers.add(sub);
     const keep = setInterval(() => { try { res.write(': keepalive\n\n'); } catch { /* closed */ } }, 15000);
-    req.on('close', () => { clearInterval(keep); spikeSubscribers.delete(res); });
+    req.on('close', () => { clearInterval(keep); eventSubscribers.delete(sub); });
     return;
   }
 
@@ -572,56 +563,46 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   jsonResponse(res, 404, { error: 'Not found' });
 }
 
-// ─── Spike 017: extension event store, stats and SSE fan-out ─────────
-type SpikeEvent = { tabId: number; method: string; daemonAt: number; extAt: number; ts: number; bytes: number; w: number; h: number; sessionId: number };
-const spikeEvents: SpikeEvent[] = [];
-let spikeLastFrame: { tabId: number; at: number; jpeg: Buffer; w: number; h: number } | null = null;
-let spikeTotal = 0;
-const spikeSubscribers = new Set<ServerResponse>();
+// ─── Live view: extension events, SSE fan-out per session, counts ────
+// Frames are only forwarded to subscribers; nothing but counts is kept.
+type EventCount = { session: string; method: string; daemonAt: number; bytes: number };
+const recentEvents: EventCount[] = [];
+let eventTotal = 0;
+const eventSubscribers = new Set<{ res: ServerResponse; session: string | null }>();
 function recordExtensionEvent(msg: any): void {
   const daemonAt = Date.now();
   const params = msg.params ?? {};
-  const meta = params.metadata ?? {};
-  const bytes = typeof params.data === 'string' ? params.data.length : 0;
-  const ev: SpikeEvent = {
-    tabId: msg.tabId, method: msg.method, daemonAt, extAt: msg.receivedAt ?? daemonAt,
-    ts: typeof meta.timestamp === 'number' ? meta.timestamp * 1000 : 0, bytes,
-    w: meta.deviceWidth ?? 0, h: meta.deviceHeight ?? 0, sessionId: params.sessionId ?? -1,
-  };
-  spikeTotal++;
-  spikeEvents.push(ev);
-  if (spikeEvents.length > 2000) spikeEvents.splice(0, spikeEvents.length - 2000);
-  if (msg.method === 'Page.screencastFrame' && typeof params.data === 'string') {
-    spikeLastFrame = { tabId: msg.tabId, at: daemonAt, jpeg: Buffer.from(params.data, 'base64'), w: ev.w, h: ev.h };
-  }
-  if (spikeSubscribers.size) {
-    const line = `data: ${JSON.stringify({ ...ev, visible: params.visible })}\n\n`;
-    for (const res of spikeSubscribers) { try { res.write(line); } catch { spikeSubscribers.delete(res); } }
+  const session = typeof msg.session === 'string' ? msg.session : '';
+  eventTotal++;
+  recentEvents.push({ session, method: String(msg.method), daemonAt, bytes: typeof params.data === 'string' ? Math.floor(params.data.length * 0.75) : 0 });
+  if (recentEvents.length > 2000) recentEvents.splice(0, recentEvents.length - 2000);
+  if (eventSubscribers.size) {
+    const line = `data: ${JSON.stringify({ type: 'event', session: msg.session, page: msg.page, tabId: msg.tabId, method: msg.method, params, receivedAt: msg.receivedAt ?? daemonAt })}\n\n`;
+    for (const sub of eventSubscribers) {
+      if (sub.session !== null && sub.session !== session) continue;
+      try { sub.res.write(line); } catch { eventSubscribers.delete(sub); }
+    }
   }
 }
-function pct(sorted: number[], p: number): number { if (!sorted.length) return 0; return sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]; }
-function spikeStats(windowMs = 5000): Record<string, unknown> {
+function eventStats(windowMs = 5000): Record<string, unknown> {
   const now = Date.now();
-  const recent = spikeEvents.filter((e) => e.method === 'Page.screencastFrame' && now - e.daemonAt <= windowMs);
-  const lat = recent.filter((e) => e.ts > 0).map((e) => e.daemonAt - e.ts).sort((a, b) => a - b);
-  const extLat = recent.filter((e) => e.ts > 0).map((e) => e.extAt - e.ts).sort((a, b) => a - b);
-  const hops = recent.map((e) => e.daemonAt - e.extAt).sort((a, b) => a - b);
-  const kb = recent.reduce((a, e) => a + e.bytes * 0.75, 0) / 1024;
-  return {
-    total: spikeTotal, windowMs, frames: recent.length, fps: recent.length / (windowMs / 1000),
-    latencyMs: { p50: pct(lat, 0.5), p95: pct(lat, 0.95), max: lat[lat.length - 1] ?? 0 },
-    extensionLatencyMs: { p50: pct(extLat, 0.5), p95: pct(extLat, 0.95) },
-    extToDaemonMs: { p50: pct(hops, 0.5), p95: pct(hops, 0.95) },
-    kbPerSec: kb / (windowMs / 1000),
-    avgFrameKb: recent.length ? kb / recent.length : 0,
-    lastFrame: spikeLastFrame ? { tabId: spikeLastFrame.tabId, ageMs: now - spikeLastFrame.at, w: spikeLastFrame.w, h: spikeLastFrame.h, bytes: spikeLastFrame.jpeg.length } : null,
-    visibility: spikeEvents.filter((e) => e.method === 'Page.screencastVisibilityChanged').slice(-3),
-  };
+  const frames = recentEvents.filter((e) => e.method === 'Page.screencastFrame' && now - e.daemonAt <= windowMs);
+  const bySession: Record<string, { frames: number; fps: number; kbPerSec: number }> = {};
+  for (const e of frames) {
+    const k = e.session || '(none)';
+    const cur = (bySession[k] ??= { frames: 0, fps: 0, kbPerSec: 0 });
+    cur.frames++;
+    cur.kbPerSec += e.bytes / 1024 / (windowMs / 1000);
+  }
+  for (const cur of Object.values(bySession)) cur.fps = cur.frames / (windowMs / 1000);
+  return { total: eventTotal, windowMs, frames: frames.length, fps: frames.length / (windowMs / 1000), subscribers: eventSubscribers.size, bySession };
 }
 
 // ─── WebSocket for Extension ─────────────────────────────────────────
 
 const httpServer = createServer((req, res) => { handleRequest(req, res).catch(() => { res.writeHead(500); res.end(); }); });
+// SSE streams are long-lived: no per-request deadline.
+httpServer.requestTimeout = 0;
 const wss = new WebSocketServer({
   server: httpServer,
   path: '/ext',
@@ -687,7 +668,7 @@ wss.on('connection', (ws: WebSocket) => {
       // keeps the MV3 service worker alive; nothing to do here.
       if (msg.type === 'ping') return;
 
-      // Spike 017: unsolicited events from the extension (screencast frames)
+      // Unsolicited events from the extension (screencast frames, tab activation)
       if (msg.type === 'event') { recordExtensionEvent(msg); return; }
 
       // Handle command results
