@@ -232,9 +232,23 @@ async function connectAttempt(): Promise<void> {
 function sessionsOwningTab(tabId: number): string[] {
   const names: string[] = [];
   for (const [leaseKey, session] of automationSessions.entries()) {
-    if (session.preferredTabId === tabId || adoptedTabs.get(leaseKey)?.has(tabId)) names.push(session.session);
+    if (session.preferredTabId === tabId || adoptedTabs.get(leaseKey)?.has(tabId)) {
+      names.push(session.session);
+      touchWatchedLease(leaseKey);
+    }
   }
   return names;
+}
+
+// A session whose frames are being watched stays alive even with no commands:
+// refresh its idle timer, at most once per 30 s per lease.
+const WATCH_TOUCH_MS = 30_000;
+const lastWatchTouch = new Map<string, number>();
+function touchWatchedLease(leaseKey: string): void {
+  const now = Date.now();
+  if (now - (lastWatchTouch.get(leaseKey) ?? 0) < WATCH_TOUCH_MS) return;
+  lastWatchTouch.set(leaseKey, now);
+  resetWindowIdleTimer(leaseKey);
 }
 
 async function relayEvent(tabId: number, method: string, params: unknown, receivedAt: number, pageOverride?: string): Promise<void> {
@@ -1167,6 +1181,7 @@ async function createOwnedTabLeaseUnlocked(leaseKey: string, initialUrl?: string
       await new Promise(resolve => setTimeout(resolve, 300));
       ownTab = await chrome.tabs.get(ownTabId);
     }
+    ownedWindowLedger.set(ownWindowId, leaseKey);
     setLeaseSession(leaseKey, {
       session: getSessionFromKey(leaseKey),
       surface: getSurfaceFromKey(leaseKey),
@@ -1257,6 +1272,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
       container.groupId = null;
     }
   }
+  ownedWindowLedger.delete(windowId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.windowId === windowId) {
       console.log(`[opencli] ${session.surface} container closed (session=${session.session})`);
@@ -1273,6 +1289,9 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 // Spike 017: a tab the page opens (window.open, sign-in popups) joins the session
 // that owns its opener: moved into the session window, made active, and targetable.
 const adoptedTabs = new Map<string, Set<number>>();
+// windowId -> leaseKey for session windows this worker created (or restored). A page-addressed
+// command for a tab in such a window re-adopts it if the automation session was lost.
+const ownedWindowLedger = new Map<number, string>();
 function adoptedOf(leaseKey: string): Set<number> {
   let set = adoptedTabs.get(leaseKey);
   if (!set) { set = new Set(); adoptedTabs.set(leaseKey, set); }
@@ -1309,6 +1328,17 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
         session.preferredTabId = next;
         console.log(`[opencli] Session ${session.session} promoted tab ${next} (tab ${tabId} closed)`);
         continue;
+      }
+      if (session.ownWindow) {
+        // The adopted set can be empty after a worker restart while the window still has tabs.
+        const rest = await chrome.tabs.query({ windowId: session.windowId }).catch(() => [] as chrome.tabs.Tab[]);
+        const other = rest.find((t) => t.id !== undefined && t.id !== tabId && isDebuggableUrl(t.url));
+        if (other?.id !== undefined) {
+          session.preferredTabId = other.id;
+          for (const t of rest) if (t.id !== undefined && t.id !== tabId && t.id !== other.id) adoptedOf(leaseKey).add(t.id);
+          console.log(`[opencli] Session ${session.session} promoted window tab ${other.id} (tab ${tabId} closed)`);
+          continue;
+        }
       }
       if (session.idleTimer) clearTimeout(session.idleTimer);
       automationSessions.delete(leaseKey);
@@ -1629,6 +1659,29 @@ async function resolveCommandTabId(cmd: Command): Promise<number | undefined> {
 
 type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
 
+/** Restore (or extend) an own-window session around a live tab of its window. */
+async function adoptOrphanTab(leaseKey: string, tab: chrome.tabs.Tab): Promise<void> {
+  const tabId = tab.id!;
+  const existing = automationSessions.get(leaseKey);
+  if (existing) {
+    if (existing.preferredTabId !== tabId) adoptedOf(leaseKey).add(tabId);
+    return;
+  }
+  setLeaseSession(leaseKey, {
+    session: getSessionFromKey(leaseKey),
+    surface: getSurfaceFromKey(leaseKey),
+    kind: 'owned',
+    windowId: tab.windowId,
+    owned: true,
+    preferredTabId: tabId,
+    ownWindow: true,
+  });
+  const others = await chrome.tabs.query({ windowId: tab.windowId }).catch(() => [] as chrome.tabs.Tab[]);
+  for (const t of others) if (t.id !== undefined && t.id !== tabId) adoptedOf(leaseKey).add(t.id);
+  resetWindowIdleTimer(leaseKey);
+  console.log(`[opencli] ${new Date().toISOString()} Session ${getSessionFromKey(leaseKey)} re-adopted tab ${tabId} in window ${tab.windowId}`);
+}
+
 /**
  * Resolve target tab for the session lease, returning both the tabId and
  * the Tab object (when available) so callers can skip a redundant chrome.tabs.get().
@@ -1644,6 +1697,17 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
         ? (session.preferredTabId !== null ? (session.preferredTabId === tabId || adoptedOf(leaseKey).has(tabId)) : tab.windowId === session.windowId)
         : false;
       if (isDebuggableUrl(tab.url) && matchesSession) return { tabId, tab };
+      if (isDebuggableUrl(tab.url) && tab.windowId !== undefined) {
+        // The addressed tab is alive in a session window this lease owns, but the session or
+        // its adopted set was lost: take the tab back instead of opening a new one.
+        const inOwnWindow = session
+          ? session.ownWindow === true && session.windowId === tab.windowId
+          : ownedWindowLedger.get(tab.windowId) === leaseKey;
+        if (inOwnWindow) {
+          await adoptOrphanTab(leaseKey, tab);
+          return { tabId, tab };
+        }
+      }
       if (session && !session.owned) {
         throw new CommandFailure(
           matchesSession ? 'bound_tab_not_debuggable' : 'bound_tab_mismatch',
@@ -1763,6 +1827,11 @@ async function resolveTabId(tabId: number | undefined, leaseKey: string, initial
 async function listAutomationTabs(leaseKey: string): Promise<chrome.tabs.Tab[]> {
   const session = automationSessions.get(leaseKey);
   if (!session) return [];
+  if (session.ownWindow) {
+    try {
+      return await chrome.tabs.query({ windowId: session.windowId });
+    } catch { return []; }
+  }
   if (session.preferredTabId !== null) {
     try {
       const own = [await chrome.tabs.get(session.preferredTabId)];
@@ -2408,6 +2477,7 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
         identity.evictTab(id);
       }
       adoptedTabs.delete(leaseKey);
+      ownedWindowLedger.delete(session.windowId);
       await chrome.windows.remove(session.windowId).catch(() => {});
       console.log(`[opencli] Released session window ${session.windowId} (session=${session.session}, ${reason})`);
     } else if (tabId !== null) {
@@ -2495,6 +2565,11 @@ async function reconcileTargetLeaseRegistry(): Promise<void> {
         idleTimer: null,
         idleDeadlineAt: stored.idleDeadlineAt,
       });
+      if (session.ownWindow) {
+        ownedWindowLedger.set(tab.windowId, leaseKey);
+        const winTabs = await chrome.tabs.query({ windowId: tab.windowId }).catch(() => [] as chrome.tabs.Tab[]);
+        for (const t of winTabs) if (t.id !== undefined && t.id !== tabId) adoptedOf(leaseKey).add(t.id);
+      }
       if (session.owned && !session.ownWindow) {
         const role = getOwnedWindowRole(leaseKey);
         if (ownedContainers[role].windowId === null) ownedContainers[role].windowId = tab.windowId;
