@@ -1316,6 +1316,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  tabEmulation.delete(tabId);
   // Same wake-before-recovery hazard as windows.onRemoved.
   await workerReady;
   identity.evictTab(tabId);
@@ -2014,6 +2015,7 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   // re-attach after navigation when capture is not active.
   if (!executor.hasActiveNetworkCapture(tabId)) {
     await executor.detach(tabId);
+    await restoreEmulation(tabId, getSurfaceFromKey(leaseKey) === 'browser');
   }
 
   await chrome.tabs.update(tabId, { url: targetUrl });
@@ -2340,10 +2342,36 @@ async function handleCdp(cmd: Command, leaseKey: string): Promise<Result> {
         stripOpenCliFrameRoutingParams(params, false),
         commandCdpTimeoutMs(cmd),
       );
+    if (!routeFrameId) rememberEmulation(tabId, cmd.cdpMethod, stripOpenCliFrameRoutingParams(params, false));
     return pageScopedResult(cmd.id, tabId, data);
   } catch (err) {
     return errorResult(cmd.id, err);
   }
+}
+
+/**
+ * Talos live view: the emulation a tab was given (phone screen, identity, touch). A detach drops it,
+ * and navigate detaches, so navigate puts it back before the page loads.
+ */
+const tabEmulation = new Map<number, Map<string, Record<string, unknown>>>();
+
+function rememberEmulation(tabId: number, method: string, params: Record<string, unknown>): void {
+  const kept = tabEmulation.get(tabId) ?? new Map<string, Record<string, unknown>>();
+  if (method === 'Emulation.setDeviceMetricsOverride') kept.set(method, params);
+  else if (method === 'Emulation.clearDeviceMetricsOverride') kept.delete('Emulation.setDeviceMetricsOverride');
+  else if (method === 'Emulation.setUserAgentOverride') { if (params.userAgent) kept.set(method, params); else kept.delete(method); }
+  else if (method === 'Emulation.setTouchEmulationEnabled') { if (params.enabled) kept.set(method, params); else kept.delete(method); }
+  else return;
+  if (kept.size) tabEmulation.set(tabId, kept); else tabEmulation.delete(tabId);
+}
+
+async function restoreEmulation(tabId: number, aggressive: boolean): Promise<void> {
+  const kept = tabEmulation.get(tabId);
+  if (!kept?.size) return;
+  try {
+    await executor.ensureAttached(tabId, aggressive);
+    for (const [method, params] of kept) await executor.sendDebuggerCommand({ tabId }, method, params);
+  } catch { /* the page still loads, without the emulation */ }
 }
 
 function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFrameId: boolean): Record<string, unknown> {

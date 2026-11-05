@@ -1865,6 +1865,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   }
 });
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  tabEmulation.delete(tabId);
   await workerReady;
   evictTab(tabId);
   for (const set of adoptedTabs.values()) set.delete(tabId);
@@ -2412,6 +2413,7 @@ async function handleNavigate(cmd, leaseKey) {
   }
   if (!hasActiveNetworkCapture(tabId)) {
     await detach(tabId);
+    await restoreEmulation(tabId, getSurfaceFromKey(leaseKey) === "browser");
   }
   await chrome.tabs.update(tabId, { url: targetUrl });
   let timedOut = false;
@@ -2711,9 +2713,34 @@ async function handleCdp(cmd, leaseKey) {
       stripOpenCliFrameRoutingParams(params, false),
       commandCdpTimeoutMs(cmd)
     );
+    if (!routeFrameId) rememberEmulation(tabId, cmd.cdpMethod, stripOpenCliFrameRoutingParams(params, false));
     return pageScopedResult(cmd.id, tabId, data);
   } catch (err) {
     return errorResult(cmd.id, err);
+  }
+}
+const tabEmulation = /* @__PURE__ */ new Map();
+function rememberEmulation(tabId, method, params) {
+  const kept = tabEmulation.get(tabId) ?? /* @__PURE__ */ new Map();
+  if (method === "Emulation.setDeviceMetricsOverride") kept.set(method, params);
+  else if (method === "Emulation.clearDeviceMetricsOverride") kept.delete("Emulation.setDeviceMetricsOverride");
+  else if (method === "Emulation.setUserAgentOverride") {
+    if (params.userAgent) kept.set(method, params);
+    else kept.delete(method);
+  } else if (method === "Emulation.setTouchEmulationEnabled") {
+    if (params.enabled) kept.set(method, params);
+    else kept.delete(method);
+  } else return;
+  if (kept.size) tabEmulation.set(tabId, kept);
+  else tabEmulation.delete(tabId);
+}
+async function restoreEmulation(tabId, aggressive) {
+  const kept = tabEmulation.get(tabId);
+  if (!kept?.size) return;
+  try {
+    await ensureAttached(tabId, aggressive);
+    for (const [method, params] of kept) await sendDebuggerCommand({ tabId }, method, params);
+  } catch {
   }
 }
 function stripOpenCliFrameRoutingParams(params, stripFrameId) {
