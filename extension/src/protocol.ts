@@ -22,7 +22,8 @@ export type Action =
   | 'network-capture-read'
   | 'wait-download'
   | 'cdp'
-  | 'frames';
+  | 'frames'
+  | 'window';
 
 export interface Command {
   /** Unique request ID */

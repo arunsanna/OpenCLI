@@ -1082,6 +1082,18 @@ async function connectAttempt() {
     thisWs.close();
   };
 }
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method !== "Page.screencastFrame" && method !== "Page.screencastVisibilityChanged") return;
+  const tabId = source.tabId;
+  if (!tabId) return;
+  const receivedAt = Date.now();
+  if (method === "Page.screencastFrame" && params && params.sessionId !== void 0) {
+    sendDebuggerCommand({ tabId }, "Page.screencastFrameAck", { sessionId: params.sessionId }).catch(() => {
+    });
+  }
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  safeSend(ws, { type: "event", tabId, method, params, receivedAt });
+});
 const WS_KEEPALIVE_INTERVAL_MS = 2e4;
 let wsKeepaliveTimer = null;
 let wsKeepaliveSocket = null;
@@ -1758,9 +1770,36 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   }
   await persistRuntimeState();
 });
+const adoptedTabs = /* @__PURE__ */ new Map();
+function adoptedOf(leaseKey) {
+  let set = adoptedTabs.get(leaseKey);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    adoptedTabs.set(leaseKey, set);
+  }
+  return set;
+}
+chrome.tabs.onCreated.addListener(async (tab) => {
+  await workerReady;
+  const opener = tab.openerTabId;
+  if (opener == null || tab.id == null) return;
+  for (const [leaseKey, session] of automationSessions.entries()) {
+    if (session.preferredTabId !== opener && !adoptedOf(leaseKey).has(opener)) continue;
+    try {
+      if (tab.windowId !== session.windowId) await chrome.tabs.move(tab.id, { windowId: session.windowId, index: -1 });
+      await chrome.tabs.update(tab.id, { active: true });
+    } catch (err) {
+      console.warn(`[opencli] adopt popup ${tab.id} for ${session.session}: ${err}`);
+    }
+    adoptedOf(leaseKey).add(tab.id);
+    console.log(`[opencli] Session ${session.session} adopted popup tab ${tab.id} (opener ${opener})`);
+    break;
+  }
+});
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   await workerReady;
   evictTab(tabId);
+  for (const set of adoptedTabs.values()) set.delete(tabId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
       if (session.idleTimer) clearTimeout(session.idleTimer);
@@ -1890,6 +1929,8 @@ async function handleCommand(cmd) {
         return await handleNavigate(cmd, leaseKey);
       case "tabs":
         return await handleTabs(cmd, leaseKey);
+      case "window":
+        return await handleWindow(cmd, leaseKey);
       case "cookies":
         return await handleCookies(cmd);
       case "screenshot":
@@ -2005,7 +2046,7 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
     try {
       const tab = await chrome.tabs.get(tabId);
       const session = existingSession;
-      const matchesSession = session ? session.preferredTabId !== null ? session.preferredTabId === tabId : tab.windowId === session.windowId : false;
+      const matchesSession = session ? session.preferredTabId !== null ? session.preferredTabId === tabId || adoptedOf(leaseKey).has(tabId) : tab.windowId === session.windowId : false;
       if (isDebuggableUrl(tab.url) && matchesSession) return { tabId, tab };
       if (session && !session.owned) {
         throw new CommandFailure(
@@ -2106,7 +2147,15 @@ async function listAutomationTabs(leaseKey) {
   if (!session) return [];
   if (session.preferredTabId !== null) {
     try {
-      return [await chrome.tabs.get(session.preferredTabId)];
+      const own = [await chrome.tabs.get(session.preferredTabId)];
+      for (const id of adoptedOf(leaseKey)) {
+        try {
+          own.push(await chrome.tabs.get(id));
+        } catch {
+          adoptedOf(leaseKey).delete(id);
+        }
+      }
+      return own;
     } catch {
       automationSessions.delete(leaseKey);
       return [];
@@ -2259,6 +2308,30 @@ async function handleNavigate(cmd, leaseKey) {
     }
   }
   return pageScopedResult(cmd.id, tabId, { title: tab.title, url: tab.url, timedOut });
+}
+async function handleWindow(cmd, leaseKey) {
+  const session = automationSessions.get(leaseKey);
+  if (!session) return { id: cmd.id, ok: false, error: "No session window yet; navigate first" };
+  const c = cmd;
+  const describe = (win) => ({ windowId: win.id, left: win.left, top: win.top, width: win.width, height: win.height, state: win.state, focused: win.focused });
+  try {
+    if (c.op === "bounds") {
+      const info = {};
+      for (const k of ["left", "top", "width", "height"]) if (typeof c[k] === "number") info[k] = c[k];
+      if (c.windowState === "minimized") info.state = "minimized";
+      if (c.windowState === "normal" && Object.keys(info).length === 0) info.state = "normal";
+      const win2 = await chrome.windows.update(session.windowId, info);
+      return { id: cmd.id, ok: true, data: describe(win2) };
+    }
+    if (c.op === "all") {
+      const wins = await chrome.windows.getAll({ populate: true });
+      return { id: cmd.id, ok: true, data: wins.map((w) => ({ ...describe(w), type: w.type, tabs: (w.tabs ?? []).map((t) => ({ id: t.id, active: t.active, groupId: t.groupId, openerTabId: t.openerTabId, title: t.title, url: t.url })) })) };
+    }
+    const win = await chrome.windows.get(session.windowId);
+    return { id: cmd.id, ok: true, data: describe(win) };
+  } catch (err) {
+    return errorResult(cmd.id, err);
+  }
 }
 async function handleTabs(cmd, leaseKey) {
   const session = automationSessions.get(leaseKey);
@@ -2456,7 +2529,19 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "Runtime.enable",
   // Emulation (used by screenshot full-page)
   "Emulation.setDeviceMetricsOverride",
-  "Emulation.clearDeviceMetricsOverride"
+  "Emulation.clearDeviceMetricsOverride",
+  // Spike 017: live view (screencast push) and touch control
+  "Page.startScreencast",
+  "Page.stopScreencast",
+  "Page.screencastFrameAck",
+  "Input.dispatchTouchEvent",
+  "Input.synthesizeScrollGesture",
+  "Input.synthesizePinchGesture",
+  "Emulation.setTouchEmulationEnabled",
+  "Emulation.setEmitTouchEventsForMouse",
+  "Browser.getWindowForTarget",
+  "Browser.setWindowBounds",
+  "Browser.getWindowBounds"
 ]);
 async function handleCdp(cmd, leaseKey) {
   if (!cmd.cdpMethod) return { id: cmd.id, ok: false, error: "Missing cdpMethod" };
