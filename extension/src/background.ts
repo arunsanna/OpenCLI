@@ -2308,6 +2308,8 @@ const CDP_ALLOWLIST = new Set([
   'Input.synthesizeScrollGesture',
   'Input.synthesizePinchGesture',
   'Emulation.setTouchEmulationEnabled',
+  // Talos live view: the shown tab asks for the phone version of a site while a phone has control
+  'Emulation.setUserAgentOverride',
   'Emulation.setEmitTouchEventsForMouse',
   'Browser.getWindowForTarget',
   'Browser.setWindowBounds',
