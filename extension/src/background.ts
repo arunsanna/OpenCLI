@@ -1905,7 +1905,6 @@ async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.code) return { id: cmd.id, ok: false, error: 'Missing code' };
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
-  await activateIfHidden(tabId, leaseKey);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     if (cmd.frameIndex != null) {
@@ -1955,6 +1954,11 @@ async function closeSessionTab(leaseKey: string, tabId: number): Promise<void> {
 }
 
 /** A hidden tab ignores input and sends no frames: bring it forward first. */
+const ACTIVATING_CDP = new Set(['Page.captureScreenshot', 'Page.startScreencast']);
+function cdpNeedsVisibleTab(method: string): boolean {
+  return method.startsWith('Input.') || ACTIVATING_CDP.has(method);
+}
+
 async function activateIfHidden(tabId: number, leaseKey: string): Promise<void> {
   if (!automationSessions.get(leaseKey)?.ownWindow) return;
   try {
@@ -1991,7 +1995,6 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
   const resolved = await resolveTab(cmdTabId, leaseKey);
   const tabId = resolved.tabId;
-  await activateIfHidden(tabId, leaseKey);
 
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
@@ -2255,6 +2258,7 @@ async function handleCookies(cmd: Command): Promise<Result> {
 async function handleScreenshot(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
+  await activateIfHidden(tabId, leaseKey);
   try {
     const data = await executor.screenshot(tabId, {
       format: cmd.format,
@@ -2318,7 +2322,7 @@ async function handleCdp(cmd: Command, leaseKey: string): Promise<Result> {
   }
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
-  await activateIfHidden(tabId, leaseKey);
+  if (cdpNeedsVisibleTab(cmd.cdpMethod)) await activateIfHidden(tabId, leaseKey);
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     await executor.ensureAttached(tabId, aggressive);
@@ -2418,6 +2422,7 @@ async function handleInsertText(cmd: Command, leaseKey: string): Promise<Result>
   }
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
+  await activateIfHidden(tabId, leaseKey);
   try {
     await executor.insertText(tabId, cmd.text);
     return pageScopedResult(cmd.id, tabId, { inserted: true });
