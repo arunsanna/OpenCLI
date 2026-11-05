@@ -163,6 +163,8 @@ function createChromeMock() {
       }),
       onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } as Listener<(id: number, info: chrome.tabs.TabChangeInfo) => void>,
       onRemoved: { addListener: vi.fn() } as Listener<(tabId: number) => void>,
+      onCreated: { addListener: vi.fn() } as Listener<(tab: chrome.tabs.Tab) => void>,
+      onActivated: { addListener: vi.fn() } as Listener<(info: { tabId: number; windowId: number }) => void>,
     },
     tabGroups: {
       TAB_GROUP_ID_NONE: -1,
@@ -703,6 +705,7 @@ describe('background tab isolation', () => {
     await chrome.storage.local.set({ opencli_idle_interactive_v1: token });
     vi.stubGlobal('chrome', chrome);
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.reconcileTargetLeaseRegistry();
     expect(mod.__test__.getInteractiveContainer().windowId).toBe(7);
     expect(await mod.__test__.resolveTabId(undefined, browserKey('restored'), 'https://target.example')).toBe(70);
@@ -731,6 +734,7 @@ describe('background tab isolation', () => {
     groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
     vi.stubGlobal('chrome', chrome);
     let mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.reconcileTargetLeaseRegistry();
     mod.__test__.setSession(browserKey('owned'), { windowId: 7, owned: true, preferredTabId: 70 });
     await mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'owned', surface: 'browser' });
@@ -738,6 +742,7 @@ describe('background tab isolation', () => {
     await chrome.storage.session.set({ opencli_target_lease_registry_v2: undefined });
     vi.resetModules();
     mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.reconcileTargetLeaseRegistry();
     expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(70);
     expect(chrome.windows.create).not.toHaveBeenCalled();
@@ -760,6 +765,7 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.reconcileTargetLeaseRegistry();
     groups[0].title = '';
     chrome.tabGroups.update.mockRejectedValueOnce(new Error('group update failed'));
@@ -787,6 +793,7 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.get.mockRejectedValueOnce(new Error('permission denied'));
 
@@ -813,6 +820,7 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.windows.get
       .mockResolvedValueOnce({ id: 7, focused: false })
@@ -841,6 +849,7 @@ describe('background tab isolation', () => {
     });
 
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.reconcileTargetLeaseRegistry();
     chrome.tabGroups.get.mockRejectedValueOnce(new Error('permission denied'));
 
@@ -1456,6 +1465,7 @@ describe('background tab isolation', () => {
       if (index >= 0) tabs.splice(index, 1);
     });
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.resolveTabId(undefined, browserKey('first'));
     await mod.__test__.resolveTabId(undefined, browserKey('second'));
     const firstTab = mod.__test__.getSession(browserKey('first'))!.preferredTabId!;
@@ -1484,6 +1494,7 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.resolveTabId(undefined, browserKey('retry'));
     const session = mod.__test__.getSession(browserKey('retry'))!;
     chrome.tabs[operation].mockRejectedValueOnce(new Error('Chrome refused cleanup'));
@@ -1546,6 +1557,7 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.resolveTabId(undefined, browserKey('closing'));
     const started = deferred<void>();
     const finish = deferred<void>();
@@ -1577,6 +1589,7 @@ describe('background tab isolation', () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     await mod.__test__.resolveTabId(undefined, browserKey('owner'));
     const owned = mod.__test__.getSession(browserKey('owner'))!;
     mod.__test__.setSession(browserKey('borrower'), {
@@ -1867,6 +1880,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const mod = await import('./background');
+    mod.__test__.setOwnWindowLeases(false); // legacy shared-container behaviour
     const browserTabId = await mod.__test__.resolveTabId(undefined, browserKey('default'));
     const adapterTabId = await mod.__test__.resolveTabId(undefined, adapterKey('twitter'));
 

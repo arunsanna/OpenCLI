@@ -23,7 +23,8 @@ export type Action =
   | 'wait-download'
   | 'cdp'
   | 'frames'
-  | 'window';
+  | 'window'
+  | 'reload';
 
 export interface Command {
   /** Unique request ID */
