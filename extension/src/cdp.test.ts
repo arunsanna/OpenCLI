@@ -416,6 +416,49 @@ describe('cdp download waits', () => {
       state: 'complete',
     });
   });
+
+  it('takes over a download Chrome holds at its Save prompt', async () => {
+    vi.useFakeTimers();
+    const held = {
+      id: 51,
+      filename: '',
+      url: 'https://files.example/report',
+      finalUrl: 'https://cdn.example/report.csv',
+      mime: 'text/csv',
+      state: 'in_progress',
+      bytesReceived: 5,
+      totalBytes: 5,
+      danger: 'safe',
+      startTime: new Date().toISOString(),
+    } as chrome.downloads.DownloadItem;
+    const mock = chromeMockForDownloads([held]);
+    const cancel = vi.fn(async () => {});
+    (mock.downloads as unknown as { cancel: typeof cancel }).cancel = cancel;
+    vi.stubGlobal('chrome', mock.chrome);
+    const fetchMock = vi.fn(async () => new Response('a,b\n1', {
+      status: 200,
+      headers: { 'content-disposition': 'attachment; filename="report 2026.csv"' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const mod = await import('./cdp');
+    const promise = mod.waitForDownload('report', 10_000);
+    await vi.advanceTimersByTimeAsync(2100);
+
+    await expect(promise).resolves.toMatchObject({
+      downloaded: true,
+      held: true,
+      id: 51,
+      filename: '',
+      suggestedName: 'report 2026.csv',
+      totalBytes: 5,
+      contentBase64: btoa('a,b\n1'),
+    });
+    expect(cancel).toHaveBeenCalledWith(51);
+    expect(fetchMock).toHaveBeenCalledWith('https://cdn.example/report.csv', { credentials: 'include', redirect: 'follow' });
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
 });
 
 describe('cdp network capture survives forced re-attach', () => {

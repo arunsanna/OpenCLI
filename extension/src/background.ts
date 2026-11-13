@@ -1628,6 +1628,20 @@ function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: 
   return frames;
 }
 
+/** The page's frames from another origin: the ones in the tab's frame tree, then the ones Chrome
+ *  runs in another process. `frames` and `exec`'s `frameIndex` share this order. */
+async function listCrossOriginFrames(tabId: number): Promise<Array<{ index: number; frameId: string; url: string; name: string }>> {
+  const frames = enumerateCrossOriginFrames(await executor.getFrameTree(tabId));
+  const listed = new Set(frames.map((frame) => frame.frameId));
+  const remote = await Promise.resolve().then(() => executor.getOutOfProcessFrames(tabId)).catch(() => []);
+  for (const frame of remote ?? []) {
+    if (listed.has(frame.frameId)) continue;
+    listed.add(frame.frameId);
+    frames.push({ index: frames.length, frameId: frame.frameId, url: frame.url, name: frame.name });
+  }
+  return frames;
+}
+
 /** Browser-surface leases get their own window; tests of the legacy shared container turn this off. */
 let ownWindowLeases = true;
 
@@ -1908,8 +1922,7 @@ async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
     if (cmd.frameIndex != null) {
-      const tree = await executor.getFrameTree(tabId);
-      const frames = enumerateCrossOriginFrames(tree);
+      const frames = await listCrossOriginFrames(tabId);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
@@ -1927,8 +1940,7 @@ async function handleFrames(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const tree = await executor.getFrameTree(tabId);
-    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree) };
+    return { id: cmd.id, ok: true, data: await listCrossOriginFrames(tabId) };
   } catch (err) {
     return errorResult(cmd.id, err);
   }

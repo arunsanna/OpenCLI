@@ -380,6 +380,61 @@ function downloadResult(item, startedAt) {
     elapsedMs: Date.now() - startedAt
   };
 }
+const HELD_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;
+const HELD_DOWNLOAD_POLL_MS = 1e3;
+function heldDownloadName(disposition, url) {
+  const star = /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i.exec(disposition ?? "");
+  const plain = /filename\s*=\s*("([^"]*)"|[^;]+)/i.exec(disposition ?? "");
+  let name = "";
+  try {
+    if (star) name = decodeURIComponent(star[1].trim());
+    else if (plain) name = (plain[2] ?? plain[1]).trim();
+    else name = decodeURIComponent(new URL(url).pathname.split("/").filter(Boolean).pop() ?? "");
+  } catch {
+  }
+  return name || "download";
+}
+function bytesToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 32768) binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+  return btoa(binary);
+}
+async function takeHeldDownload(item, startedAt) {
+  const base = { id: item.id, url: item.url, finalUrl: item.finalUrl, mime: item.mime, danger: item.danger, startTime: item.startTime, held: true };
+  const fail = (why) => ({
+    ...base,
+    downloaded: false,
+    state: "interrupted",
+    elapsedMs: Date.now() - startedAt,
+    error: `Chrome asked where to save the file, and the bridge could not fetch it itself: ${why}`
+  });
+  await Promise.resolve().then(() => chrome.downloads.cancel(item.id)).catch(() => {
+  });
+  const url = item.finalUrl || item.url || "";
+  if (!/^https?:\/\//i.test(url)) return fail("it is not an http link");
+  if (item.totalBytes > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
+  try {
+    const response = await fetch(url, { credentials: "include", redirect: "follow" });
+    if (!response.ok) return fail(`the link answered HTTP ${response.status}`);
+    if (Number(response.headers.get("content-length") ?? 0) > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
+    return {
+      ...base,
+      downloaded: true,
+      state: "complete",
+      filename: "",
+      elapsedMs: Date.now() - startedAt,
+      suggestedName: heldDownloadName(response.headers.get("content-disposition"), response.url || url),
+      finalUrl: response.url || url,
+      mime: item.mime || response.headers.get("content-type") || "",
+      totalBytes: bytes.byteLength,
+      contentBase64: bytesToBase64(bytes)
+    };
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+}
 async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
   const startedAt = Date.now();
   const timeout = Math.max(1, timeoutMs);
@@ -395,6 +450,7 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      clearInterval(heldPoll);
       chrome.downloads.onCreated.removeListener(onCreated);
       chrome.downloads.onChanged.removeListener(onChanged);
       resolve(result);
@@ -430,6 +486,29 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
         elapsedMs: Date.now() - startedAt
       });
     }, timeout);
+    const waiting = /* @__PURE__ */ new Map();
+    let taking = false;
+    const heldPoll = setInterval(() => {
+      if (done || taking) return;
+      void chrome.downloads.search({
+        limit: 50,
+        orderBy: ["-startTime"],
+        startedAfter: new Date(floor).toISOString()
+      }).then((recent) => {
+        if (done || taking) return;
+        for (const item of recent) {
+          if (item.state !== "in_progress" || item.filename || !(item.bytesReceived > 0) || !fresh(item) || !matchesDownloadPattern(item, pattern)) continue;
+          if (waiting.get(item.id) !== item.bytesReceived) {
+            waiting.set(item.id, item.bytesReceived);
+            continue;
+          }
+          taking = true;
+          void takeHeldDownload(item, startedAt).then(finish);
+          return;
+        }
+      }).catch(() => {
+      });
+    }, HELD_DOWNLOAD_POLL_MS);
     chrome.downloads.onCreated.addListener(onCreated);
     chrome.downloads.onChanged.addListener(onChanged);
     void chrome.downloads.search({
@@ -559,6 +638,31 @@ function registerFrameTracking() {
 async function getFrameTree(tabId) {
   await ensureAttached(tabId);
   return sendDebuggerCommand({ tabId }, "Page.getFrameTree");
+}
+async function getOutOfProcessFrames(tabId) {
+  await ensureAttached(tabId);
+  const doc = await sendDebuggerCommand({ tabId }, "DOM.getDocument", { depth: -1, pierce: true });
+  const owners = [];
+  const attribute = (node, name) => {
+    const list = Array.isArray(node.attributes) ? node.attributes : [];
+    const at = list.findIndex((value, index) => index % 2 === 0 && value === name);
+    return at >= 0 ? String(list[at + 1] ?? "") : "";
+  };
+  const walk = (node) => {
+    if (!node) return;
+    if ((node.nodeName === "IFRAME" || node.nodeName === "FRAME") && node.frameId && !node.contentDocument) {
+      owners.push({ frameId: String(node.frameId), src: attribute(node, "src"), name: attribute(node, "name") });
+    }
+    for (const child of node.children ?? []) walk(child);
+    for (const shadow of node.shadowRoots ?? []) walk(shadow);
+    walk(node.contentDocument);
+    walk(node.templateContent);
+  };
+  walk(doc?.root);
+  if (!owners.length) return [];
+  const targets = await sendDebuggerCommand({ tabId }, "Target.getTargets").catch(() => null);
+  const urls = new Map((targets?.targetInfos ?? []).map((target) => [target.targetId || target.id || "", target.url || ""]));
+  return owners.map((owner) => ({ frameId: owner.frameId, url: urls.get(owner.frameId) || owner.src, name: owner.name }));
 }
 async function evaluateInFrame(tabId, expression, frameId, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
   await ensureAttached(tabId, aggressiveRetry);
@@ -2117,6 +2221,17 @@ function enumerateCrossOriginFrames(tree) {
   collect(tree.frameTree, getUrlOrigin(rootUrl));
   return frames;
 }
+async function listCrossOriginFrames(tabId) {
+  const frames = enumerateCrossOriginFrames(await getFrameTree(tabId));
+  const listed = new Set(frames.map((frame) => frame.frameId));
+  const remote = await Promise.resolve().then(() => getOutOfProcessFrames(tabId)).catch(() => []);
+  for (const frame of remote ?? []) {
+    if (listed.has(frame.frameId)) continue;
+    listed.add(frame.frameId);
+    frames.push({ index: frames.length, frameId: frame.frameId, url: frame.url, name: frame.name });
+  }
+  return frames;
+}
 let ownWindowLeases = true;
 function setLeaseSession(leaseKey, session) {
   if (session.preferredTabId !== null && closingTabs.has(session.preferredTabId)) {
@@ -2335,8 +2450,7 @@ async function handleExec(cmd, leaseKey) {
   try {
     const aggressive = getSurfaceFromKey(leaseKey) === "browser";
     if (cmd.frameIndex != null) {
-      const tree = await getFrameTree(tabId);
-      const frames = enumerateCrossOriginFrames(tree);
+      const frames = await listCrossOriginFrames(tabId);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
@@ -2353,8 +2467,7 @@ async function handleFrames(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const tree = await getFrameTree(tabId);
-    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree) };
+    return { id: cmd.id, ok: true, data: await listCrossOriginFrames(tabId) };
   } catch (err) {
     return errorResult(cmd.id, err);
   }

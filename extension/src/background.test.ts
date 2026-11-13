@@ -519,6 +519,39 @@ describe('background tab isolation', () => {
     expect(waitForDownload).toHaveBeenCalledWith('receipt', 1234, undefined);
   });
 
+  it('lists a frame Chrome runs in another process after the frames of the tree', async () => {
+    const { chrome } = createChromeMock();
+    chrome.debugger.sendCommand = vi.fn(async (_target: unknown, method: string) => {
+      if (method === 'Page.getFrameTree') {
+        return { frameTree: { frame: { id: 'root', url: 'https://main.example/' }, childFrames: [
+          { frame: { id: 'in-process', url: 'https://sub.main.example/widget', name: 'near' } },
+        ] } };
+      }
+      if (method === 'DOM.getDocument') {
+        return { root: { nodeName: '#document', children: [{ nodeName: 'HTML', children: [{ nodeName: 'BODY', children: [
+          { nodeName: 'IFRAME', frameId: 'in-process', attributes: ['src', 'https://sub.main.example/widget'], contentDocument: { nodeName: '#document', children: [] } },
+          { nodeName: 'DIV', shadowRoots: [{ nodeName: '#document-fragment', children: [
+            { nodeName: 'IFRAME', frameId: 'OOPIF-1', attributes: ['name', 'pay', 'src', 'https://other.example/start'] },
+          ] }] },
+        ] }] }] } };
+      }
+      if (method === 'Target.getTargets') return { targetInfos: [{ targetId: 'OOPIF-1', type: 'iframe', url: 'https://other.example/now' }] };
+      return {};
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId(adapterKey('twitter'), 1);
+
+    const result = await mod.__test__.handleCommand({ id: 'frames', action: 'frames', session: 'twitter', surface: 'adapter' });
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toEqual([
+      { index: 0, frameId: 'in-process', url: 'https://sub.main.example/widget', name: 'near' },
+      { index: 1, frameId: 'OOPIF-1', url: 'https://other.example/now', name: 'pay' },
+    ]);
+  });
+
   it('routes exec frameIndex through the same cross-origin frame ordering as handleFrames', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

@@ -60,6 +60,11 @@ export type DownloadWaitResult = {
   error?: string;
   startTime?: string;
   elapsedMs: number;
+  /** Chrome was asking where to save the file, so the bridge cancelled it and fetched it itself. */
+  held?: boolean;
+  /** With `held`: the file's name from the response, and its bytes for the caller to save. */
+  suggestedName?: string;
+  contentBase64?: string;
 };
 
 const networkCaptures = new Map<number, NetworkCaptureState>();
@@ -443,6 +448,63 @@ function downloadResult(item: chrome.downloads.DownloadItem, startedAt: number):
   };
 }
 
+/** The largest held download the bridge fetches itself and hands over inline. */
+const HELD_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;
+const HELD_DOWNLOAD_POLL_MS = 1000;
+
+function heldDownloadName(disposition: string | null, url: string): string {
+  const star = /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i.exec(disposition ?? '');
+  const plain = /filename\s*=\s*("([^"]*)"|[^;]+)/i.exec(disposition ?? '');
+  let name = '';
+  try {
+    if (star) name = decodeURIComponent(star[1].trim());
+    else if (plain) name = (plain[2] ?? plain[1]).trim();
+    else name = decodeURIComponent(new URL(url).pathname.split('/').filter(Boolean).pop() ?? '');
+  } catch { /* an undecodable name falls back to the default */ }
+  return name || 'download';
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+/**
+ * A download Chrome holds at its Save prompt (the user's "ask where to save each file" setting)
+ * never finishes for an agent, and an extension cannot answer the prompt or turn the setting off.
+ * So the held download is cancelled, which closes the prompt, and the same URL is fetched here
+ * with the profile's cookies; the bytes go back to the caller to save.
+ */
+async function takeHeldDownload(item: chrome.downloads.DownloadItem, startedAt: number): Promise<DownloadWaitResult> {
+  const base = { id: item.id, url: item.url, finalUrl: item.finalUrl, mime: item.mime, danger: item.danger, startTime: item.startTime, held: true };
+  const fail = (why: string): DownloadWaitResult => ({
+    ...base, downloaded: false, state: 'interrupted', elapsedMs: Date.now() - startedAt,
+    error: `Chrome asked where to save the file, and the bridge could not fetch it itself: ${why}`,
+  });
+  await Promise.resolve().then(() => chrome.downloads.cancel(item.id)).catch(() => {});
+  const url = item.finalUrl || item.url || '';
+  if (!/^https?:\/\//i.test(url)) return fail('it is not an http link');
+  if (item.totalBytes > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
+  try {
+    const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    if (!response.ok) return fail(`the link answered HTTP ${response.status}`);
+    if (Number(response.headers.get('content-length') ?? 0) > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
+    return {
+      ...base, downloaded: true, state: 'complete', filename: '', elapsedMs: Date.now() - startedAt,
+      suggestedName: heldDownloadName(response.headers.get('content-disposition'), response.url || url),
+      finalUrl: response.url || url,
+      mime: item.mime || response.headers.get('content-type') || '',
+      totalBytes: bytes.byteLength,
+      contentBase64: bytesToBase64(bytes),
+    };
+  } catch (err) {
+    return fail(err instanceof Error ? err.message : String(err));
+  }
+}
+
 /**
  * Wait for a download to finish. `sinceMs` (epoch milliseconds) is the earliest start time that
  * counts: the caller passes the moment of its own last page action, so a file the user or an
@@ -466,6 +528,7 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
       if (done) return;
       done = true;
       clearTimeout(timer);
+      clearInterval(heldPoll);
       chrome.downloads.onCreated.removeListener(onCreated);
       chrome.downloads.onChanged.removeListener(onChanged);
       resolve(result);
@@ -503,6 +566,28 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
         elapsedMs: Date.now() - startedAt,
       });
     }, timeout);
+
+    // A fresh download that has its bytes but no file name is waiting at Chrome's Save prompt:
+    // a normal one gets its name at once. Seen twice with the same bytes, it is taken over.
+    const waiting = new Map<number, number>();
+    let taking = false;
+    const heldPoll = setInterval(() => {
+      if (done || taking) return;
+      void chrome.downloads.search({
+        limit: 50,
+        orderBy: ['-startTime'],
+        startedAfter: new Date(floor).toISOString(),
+      }).then((recent) => {
+        if (done || taking) return;
+        for (const item of recent) {
+          if (item.state !== 'in_progress' || item.filename || !(item.bytesReceived > 0) || !fresh(item) || !matchesDownloadPattern(item, pattern)) continue;
+          if (waiting.get(item.id) !== item.bytesReceived) { waiting.set(item.id, item.bytesReceived); continue; }
+          taking = true;
+          void takeHeldDownload(item, startedAt).then(finish);
+          return;
+        }
+      }).catch(() => {});
+    }, HELD_DOWNLOAD_POLL_MS);
 
     chrome.downloads.onCreated.addListener(onCreated);
     chrome.downloads.onChanged.addListener(onChanged);
@@ -668,6 +753,39 @@ export function registerFrameTracking(): void {
 export async function getFrameTree(tabId: number): Promise<any> {
   await ensureAttached(tabId);
   return sendDebuggerCommand({ tabId }, 'Page.getFrameTree');
+}
+
+/**
+ * Frames of the page that Chrome runs in another process (a frame from another site). They are
+ * missing from `Page.getFrameTree` on the tab: each is a target of its own, and the id of that
+ * target is the frame id on its `<iframe>` element, which has no content document here.
+ */
+export async function getOutOfProcessFrames(tabId: number): Promise<Array<{ frameId: string; url: string; name: string }>> {
+  await ensureAttached(tabId);
+  const doc = await sendDebuggerCommand({ tabId }, 'DOM.getDocument', { depth: -1, pierce: true }) as { root?: any };
+  const owners: Array<{ frameId: string; src: string; name: string }> = [];
+  const attribute = (node: any, name: string): string => {
+    const list: string[] = Array.isArray(node.attributes) ? node.attributes : [];
+    const at = list.findIndex((value, index) => index % 2 === 0 && value === name);
+    return at >= 0 ? String(list[at + 1] ?? '') : '';
+  };
+  const walk = (node: any): void => {
+    if (!node) return;
+    if ((node.nodeName === 'IFRAME' || node.nodeName === 'FRAME') && node.frameId && !node.contentDocument) {
+      owners.push({ frameId: String(node.frameId), src: attribute(node, 'src'), name: attribute(node, 'name') });
+    }
+    for (const child of node.children ?? []) walk(child);
+    for (const shadow of node.shadowRoots ?? []) walk(shadow);
+    walk(node.contentDocument);
+    walk(node.templateContent);
+  };
+  walk(doc?.root);
+  if (!owners.length) return [];
+  const targets = await sendDebuggerCommand({ tabId }, 'Target.getTargets').catch(() => null) as
+    | { targetInfos?: Array<{ targetId?: string; id?: string; type?: string; url?: string }> }
+    | null;
+  const urls = new Map((targets?.targetInfos ?? []).map((target) => [target.targetId || target.id || '', target.url || '']));
+  return owners.map((owner) => ({ frameId: owner.frameId, url: urls.get(owner.frameId) || owner.src, name: owner.name }));
 }
 
 export async function evaluateInFrame(
