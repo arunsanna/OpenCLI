@@ -451,6 +451,7 @@ function downloadResult(item: chrome.downloads.DownloadItem, startedAt: number):
 /** The largest held download the bridge fetches itself and hands over inline. */
 const HELD_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;
 const HELD_DOWNLOAD_POLL_MS = 1000;
+const HELD_DOWNLOAD_FETCH_MS = 60_000;
 
 function heldDownloadName(disposition: string | null, url: string): string {
   const star = /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i.exec(disposition ?? '');
@@ -487,7 +488,7 @@ async function takeHeldDownload(item: chrome.downloads.DownloadItem, startedAt: 
   if (!/^https?:\/\//i.test(url)) return fail('it is not an http link');
   if (item.totalBytes > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
   try {
-    const response = await fetch(url, { credentials: 'include', redirect: 'follow' });
+    const response = await fetch(url, { credentials: 'include', redirect: 'follow', signal: AbortSignal.timeout(HELD_DOWNLOAD_FETCH_MS) });
     if (!response.ok) return fail(`the link answered HTTP ${response.status}`);
     if (Number(response.headers.get('content-length') ?? 0) > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
     const bytes = new Uint8Array(await response.arrayBuffer());
@@ -523,6 +524,7 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
 
   return await new Promise<DownloadWaitResult>((resolve) => {
     let done = false;
+    let taking = false;
     const inProgressIds = new Set<number>();
     const finish = (result: DownloadWaitResult) => {
       if (done) return;
@@ -537,12 +539,15 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
     const inspectById = async (id: number) => {
       const items = await chrome.downloads.search({ id });
       const item = items[0];
+      // Once a held download is being taken over, its own cancel must not end the wait.
+      if (taking) return;
       if (!item || !fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(id);
       if (item.state === 'complete' || item.state === 'interrupted') finish(downloadResult(item, startedAt));
     };
 
     const onCreated = (item: chrome.downloads.DownloadItem) => {
+      if (taking) return;
       if (!fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(item.id);
       if (item.state === 'complete' || item.state === 'interrupted') finish(downloadResult(item, startedAt));
@@ -559,6 +564,7 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
       }
     };
     const timer = setTimeout(() => {
+      if (taking) return;
       finish({
         downloaded: false,
         state: 'interrupted',
@@ -570,7 +576,6 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
     // A fresh download that has its bytes but no file name is waiting at Chrome's Save prompt:
     // a normal one gets its name at once. Seen twice with the same bytes, it is taken over.
     const waiting = new Map<number, number>();
-    let taking = false;
     const heldPoll = setInterval(() => {
       if (done || taking) return;
       void chrome.downloads.search({
@@ -685,6 +690,11 @@ async function resolveFrameTargetId(tabId: number, frameId: string, targetUrl?: 
   });
   const targetId = frameTarget?.targetId || frameTarget?.id;
   if (targetId) return targetId;
+  // The tab's own session often lists no iframe targets. The browser's list does, and the target
+  // of a frame in another process carries the frame's id.
+  const known = await Promise.resolve().then(() => chrome.debugger.getTargets()).catch(() => [] as chrome.debugger.TargetInfo[]);
+  const direct = known.find((candidate) => candidate.id === frameId || (!!targetUrl && candidate.type !== 'page' && candidate.url === targetUrl));
+  if (direct) return direct.id;
   const candidates = targets
     .filter((target) => target.type === 'iframe')
     .map((target) => `${target.targetId || target.id || '?'} ${target.url || ''}`)

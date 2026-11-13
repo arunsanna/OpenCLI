@@ -432,7 +432,11 @@ describe('cdp download waits', () => {
       startTime: new Date().toISOString(),
     } as chrome.downloads.DownloadItem;
     const mock = chromeMockForDownloads([held]);
-    const cancel = vi.fn(async () => {});
+    // Cancelling reports the download as interrupted, as Chrome does: that must not end the wait.
+    const cancel = vi.fn(async (id: number) => {
+      mock.setItem({ ...held, state: 'interrupted', error: 'USER_CANCELED' } as chrome.downloads.DownloadItem);
+      mock.emitChanged({ id, state: { current: 'interrupted', previous: 'in_progress' } } as chrome.downloads.DownloadDelta);
+    });
     (mock.downloads as unknown as { cancel: typeof cancel }).cancel = cancel;
     vi.stubGlobal('chrome', mock.chrome);
     const fetchMock = vi.fn(async () => new Response('a,b\n1', {
@@ -455,7 +459,7 @@ describe('cdp download waits', () => {
       contentBase64: btoa('a,b\n1'),
     });
     expect(cancel).toHaveBeenCalledWith(51);
-    expect(fetchMock).toHaveBeenCalledWith('https://cdn.example/report.csv', { credentials: 'include', redirect: 'follow' });
+    expect(fetchMock).toHaveBeenCalledWith('https://cdn.example/report.csv', expect.objectContaining({ credentials: 'include', redirect: 'follow' }));
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });

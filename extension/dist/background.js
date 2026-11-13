@@ -382,6 +382,7 @@ function downloadResult(item, startedAt) {
 }
 const HELD_DOWNLOAD_MAX_BYTES = 25 * 1024 * 1024;
 const HELD_DOWNLOAD_POLL_MS = 1e3;
+const HELD_DOWNLOAD_FETCH_MS = 6e4;
 function heldDownloadName(disposition, url) {
   const star = /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i.exec(disposition ?? "");
   const plain = /filename\s*=\s*("([^"]*)"|[^;]+)/i.exec(disposition ?? "");
@@ -414,7 +415,7 @@ async function takeHeldDownload(item, startedAt) {
   if (!/^https?:\/\//i.test(url)) return fail("it is not an http link");
   if (item.totalBytes > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
   try {
-    const response = await fetch(url, { credentials: "include", redirect: "follow" });
+    const response = await fetch(url, { credentials: "include", redirect: "follow", signal: AbortSignal.timeout(HELD_DOWNLOAD_FETCH_MS) });
     if (!response.ok) return fail(`the link answered HTTP ${response.status}`);
     if (Number(response.headers.get("content-length") ?? 0) > HELD_DOWNLOAD_MAX_BYTES) return fail(`it is larger than ${HELD_DOWNLOAD_MAX_BYTES / (1024 * 1024)} MB`);
     const bytes = new Uint8Array(await response.arrayBuffer());
@@ -445,6 +446,7 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
   };
   return await new Promise((resolve) => {
     let done = false;
+    let taking = false;
     const inProgressIds = /* @__PURE__ */ new Set();
     const finish = (result) => {
       if (done) return;
@@ -458,11 +460,13 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
     const inspectById = async (id) => {
       const items = await chrome.downloads.search({ id });
       const item = items[0];
+      if (taking) return;
       if (!item || !fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(id);
       if (item.state === "complete" || item.state === "interrupted") finish(downloadResult(item, startedAt));
     };
     const onCreated = (item) => {
+      if (taking) return;
       if (!fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(item.id);
       if (item.state === "complete" || item.state === "interrupted") finish(downloadResult(item, startedAt));
@@ -479,6 +483,7 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
       }
     };
     const timer = setTimeout(() => {
+      if (taking) return;
       finish({
         downloaded: false,
         state: "interrupted",
@@ -487,7 +492,6 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
       });
     }, timeout);
     const waiting = /* @__PURE__ */ new Map();
-    let taking = false;
     const heldPoll = setInterval(() => {
       if (done || taking) return;
       void chrome.downloads.search({
@@ -589,6 +593,9 @@ async function resolveFrameTargetId(tabId, frameId, targetUrl) {
   });
   const targetId = frameTarget?.targetId || frameTarget?.id;
   if (targetId) return targetId;
+  const known = await Promise.resolve().then(() => chrome.debugger.getTargets()).catch(() => []);
+  const direct = known.find((candidate) => candidate.id === frameId || !!targetUrl && candidate.type !== "page" && candidate.url === targetUrl);
+  if (direct) return direct.id;
   const candidates = targets.filter((target) => target.type === "iframe").map((target) => `${target.targetId || target.id || "?"} ${target.url || ""}`).join("; ");
   throw new Error(`No iframe target found for frame ${frameId}${targetUrl ? ` (${targetUrl})` : ""}. Candidates: ${candidates || "none"}`);
 }
