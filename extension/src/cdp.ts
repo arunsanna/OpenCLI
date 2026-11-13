@@ -58,6 +58,7 @@ export type DownloadWaitResult = {
   state?: string;
   danger?: string;
   error?: string;
+  startTime?: string;
   elapsedMs: number;
 };
 
@@ -437,13 +438,26 @@ function downloadResult(item: chrome.downloads.DownloadItem, startedAt: number):
     state: item.state,
     danger: item.danger,
     error: item.error,
+    startTime: item.startTime,
     elapsedMs: Date.now() - startedAt,
   };
 }
 
-export async function waitForDownload(pattern: string = '', timeoutMs: number = 30000): Promise<DownloadWaitResult> {
+/**
+ * Wait for a download to finish. `sinceMs` (epoch milliseconds) is the earliest start time that
+ * counts: the caller passes the moment of its own last page action, so a file the user or an
+ * earlier task downloaded is never reported. Without it the look-back is the timeout itself.
+ */
+export async function waitForDownload(pattern: string = '', timeoutMs: number = 30000, sinceMs?: number): Promise<DownloadWaitResult> {
   const startedAt = Date.now();
   const timeout = Math.max(1, timeoutMs);
+  const floor = typeof sinceMs === 'number' && Number.isFinite(sinceMs) && sinceMs > 0
+    ? sinceMs
+    : startedAt - Math.max(timeout, 1000);
+  const fresh = (item: chrome.downloads.DownloadItem): boolean => {
+    const started = Date.parse(item.startTime ?? '');
+    return !Number.isFinite(started) || started >= floor;
+  };
 
   return await new Promise<DownloadWaitResult>((resolve) => {
     let done = false;
@@ -460,13 +474,13 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
     const inspectById = async (id: number) => {
       const items = await chrome.downloads.search({ id });
       const item = items[0];
-      if (!item || !matchesDownloadPattern(item, pattern)) return;
+      if (!item || !fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(id);
       if (item.state === 'complete' || item.state === 'interrupted') finish(downloadResult(item, startedAt));
     };
 
     const onCreated = (item: chrome.downloads.DownloadItem) => {
-      if (!matchesDownloadPattern(item, pattern)) return;
+      if (!fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(item.id);
       if (item.state === 'complete' || item.state === 'interrupted') finish(downloadResult(item, startedAt));
     };
@@ -496,16 +510,16 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
     void chrome.downloads.search({
       limit: 50,
       orderBy: ['-startTime'],
-      startedAfter: new Date(startedAt - Math.max(timeout, 1000)).toISOString(),
+      startedAfter: new Date(floor).toISOString(),
     }).then((recent) => {
       if (done) return;
-      const completed = recent.find((item) => item.state === 'complete' && matchesDownloadPattern(item, pattern));
+      const completed = recent.find((item) => item.state === 'complete' && fresh(item) && matchesDownloadPattern(item, pattern));
       if (completed) {
         finish(downloadResult(completed, startedAt));
         return;
       }
       for (const item of recent) {
-        if (item.state === 'in_progress' && matchesDownloadPattern(item, pattern)) inProgressIds.add(item.id);
+        if (item.state === 'in_progress' && fresh(item) && matchesDownloadPattern(item, pattern)) inProgressIds.add(item.id);
       }
     }).catch((err) => {
       finish({

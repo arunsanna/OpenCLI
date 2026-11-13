@@ -516,7 +516,7 @@ describe('background tab isolation', () => {
         elapsedMs: 12,
       },
     });
-    expect(waitForDownload).toHaveBeenCalledWith('receipt', 1234);
+    expect(waitForDownload).toHaveBeenCalledWith('receipt', 1234, undefined);
   });
 
   it('routes exec frameIndex through the same cross-origin frame ordering as handleFrames', async () => {

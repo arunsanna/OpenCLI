@@ -2484,7 +2484,7 @@ async function handleNetworkCaptureRead(cmd: Command, leaseKey: string): Promise
 
 async function handleWaitDownload(cmd: Command): Promise<Result> {
   try {
-    const data = await executor.waitForDownload(cmd.pattern ?? '', cmd.timeoutMs ?? 30000);
+    const data = await executor.waitForDownload(cmd.pattern ?? '', cmd.timeoutMs ?? 30000, cmd.sinceMs);
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return errorResult(cmd.id, err);

@@ -376,12 +376,18 @@ function downloadResult(item, startedAt) {
     state: item.state,
     danger: item.danger,
     error: item.error,
+    startTime: item.startTime,
     elapsedMs: Date.now() - startedAt
   };
 }
-async function waitForDownload(pattern = "", timeoutMs = 3e4) {
+async function waitForDownload(pattern = "", timeoutMs = 3e4, sinceMs) {
   const startedAt = Date.now();
   const timeout = Math.max(1, timeoutMs);
+  const floor = typeof sinceMs === "number" && Number.isFinite(sinceMs) && sinceMs > 0 ? sinceMs : startedAt - Math.max(timeout, 1e3);
+  const fresh = (item) => {
+    const started = Date.parse(item.startTime ?? "");
+    return !Number.isFinite(started) || started >= floor;
+  };
   return await new Promise((resolve) => {
     let done = false;
     const inProgressIds = /* @__PURE__ */ new Set();
@@ -396,12 +402,12 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4) {
     const inspectById = async (id) => {
       const items = await chrome.downloads.search({ id });
       const item = items[0];
-      if (!item || !matchesDownloadPattern(item, pattern)) return;
+      if (!item || !fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(id);
       if (item.state === "complete" || item.state === "interrupted") finish(downloadResult(item, startedAt));
     };
     const onCreated = (item) => {
-      if (!matchesDownloadPattern(item, pattern)) return;
+      if (!fresh(item) || !matchesDownloadPattern(item, pattern)) return;
       inProgressIds.add(item.id);
       if (item.state === "complete" || item.state === "interrupted") finish(downloadResult(item, startedAt));
     };
@@ -429,16 +435,16 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4) {
     void chrome.downloads.search({
       limit: 50,
       orderBy: ["-startTime"],
-      startedAfter: new Date(startedAt - Math.max(timeout, 1e3)).toISOString()
+      startedAfter: new Date(floor).toISOString()
     }).then((recent) => {
       if (done) return;
-      const completed = recent.find((item) => item.state === "complete" && matchesDownloadPattern(item, pattern));
+      const completed = recent.find((item) => item.state === "complete" && fresh(item) && matchesDownloadPattern(item, pattern));
       if (completed) {
         finish(downloadResult(completed, startedAt));
         return;
       }
       for (const item of recent) {
-        if (item.state === "in_progress" && matchesDownloadPattern(item, pattern)) inProgressIds.add(item.id);
+        if (item.state === "in_progress" && fresh(item) && matchesDownloadPattern(item, pattern)) inProgressIds.add(item.id);
       }
     }).catch((err) => {
       finish({
@@ -2843,7 +2849,7 @@ async function handleNetworkCaptureRead(cmd, leaseKey) {
 }
 async function handleWaitDownload(cmd) {
   try {
-    const data = await waitForDownload(cmd.pattern ?? "", cmd.timeoutMs ?? 3e4);
+    const data = await waitForDownload(cmd.pattern ?? "", cmd.timeoutMs ?? 3e4, cmd.sinceMs);
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return errorResult(cmd.id, err);

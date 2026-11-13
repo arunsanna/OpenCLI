@@ -362,6 +362,30 @@ describe('cdp download waits', () => {
     expect(downloads.onChanged.removeListener).toHaveBeenCalledTimes(1);
   });
 
+  it('ignores a download that started before sinceMs', async () => {
+    const old = new Date(Date.now() - 5000).toISOString();
+    const { chrome } = chromeMockForDownloads([
+      {
+        id: 3,
+        filename: '/tmp/old-installer.dmg',
+        url: 'https://other.example/old-installer.dmg',
+        finalUrl: 'https://other.example/old-installer.dmg',
+        mime: 'application/octet-stream',
+        state: 'complete',
+        totalBytes: 99,
+        danger: 'safe',
+        startTime: old,
+      } as chrome.downloads.DownloadItem,
+    ]);
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./cdp');
+    const result = await mod.waitForDownload('', 60, Date.now() - 1000);
+
+    expect(result.downloaded).toBe(false);
+    expect(result.error).toContain('No download matched');
+  });
+
   it('waits for a matching in-progress download to complete', async () => {
     const mock = chromeMockForDownloads();
     vi.stubGlobal('chrome', mock.chrome);
